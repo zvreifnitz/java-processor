@@ -21,7 +21,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
 
     private final OrderedProcessorWorker<P, V> worker;
     private final Function<V, PartitionKey<P>> extractor;
-    private final ConcurrentMap<PartitionKey<P>, Partition<V>> partitions;
+    private final PartitionQueue<P, V> partitions;
     private final LongAdder counter;
 
     public BasicOrderedProcessor(
@@ -32,7 +32,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         super(executor, afterClose);
         this.worker = requireNonNull(worker);
         this.extractor = extractor == null ? new EqualsExtractor<>() : new FunctionExtractor<>(extractor);
-        this.partitions = new ConcurrentHashMap<>();
+        this.partitions = new SyncPartitionQueue<>();
         this.counter = new LongAdder();
     }
 
@@ -84,9 +84,10 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         this.counter.increment();
         final Cons<V> queue = new Cons<>(data);
         while (this.isOpen()) {
-            final Partition<V> partition = this.getPartition(partitionKey, queue);
+            final Partition<V> partition = this.partitions.getPartition(partitionKey, queue);
             if (partition == null) {
-                return this.enqueueTask(new Task<>(this, partitionKey, queue, data));
+                this.enqueueTask(new Task<>(this, partitionKey, queue, data));
+                return true;
             }
             if (partition.append(queue)) {
                 return true;
@@ -96,13 +97,10 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         return false;
     }
 
-    private Partition<V> getPartition(final PartitionKey<P> partitionKey, final Cons<V> queue) {
-        final Partition<V> existing = this.partitions.get(partitionKey);
-        return existing != null ? existing : this.partitions.putIfAbsent(partitionKey, new Partition<>(queue));
-    }
-
-    private boolean enqueueTask(final Task<P, V> task) {
-        return this.doExecute(task);
+    private void enqueueTask(final Task<P, V> task) {
+        if (!this.doExecute(task)) {
+            task.run();
+        }
     }
 
     private record EqualsExtractor<P, V>() implements Function<V, PartitionKey<P>> {
@@ -495,6 +493,63 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
                 remainingQueue = remainingQueue.getRemainingQueue() instanceof Cons<V> q ? q : null;
             } while (remainingQueue != null && remainingQueue.getData().isDone());
             return remainingQueue;
+        }
+    }
+
+    private static sealed abstract class PartitionQueue<P, V> permits ChmPartitionQueue, SyncPartitionQueue {
+
+        protected abstract Partition<V> getPartition(final PartitionKey<P> partitionKey, final Cons<V> queue);
+
+        protected abstract void remove(final PartitionKey<P> partitionKey);
+    }
+
+    private static final class ChmPartitionQueue<P, V> extends PartitionQueue<P, V> {
+
+        private final ConcurrentMap<PartitionKey<P>, Partition<V>> partitions = new ConcurrentHashMap<>();
+
+        @Override
+        protected Partition<V> getPartition(final PartitionKey<P> partitionKey, final Cons<V> queue) {
+            final Partition<V> existing = this.partitions.get(partitionKey);
+            return existing != null ? existing : this.partitions.putIfAbsent(partitionKey, new Partition<>(queue));
+        }
+
+        @Override
+        protected void remove(final PartitionKey<P> partitionKey) {
+            this.partitions.remove(partitionKey);
+        }
+    }
+
+    private static final class SyncPartitionQueue<P, V> extends PartitionQueue<P, V> {
+
+        private static final int MASK = 127;
+        private final Map<Integer, Map<PartitionKey<P>, Partition<V>>> maps;
+
+        private SyncPartitionQueue() {
+            final Map<Integer, Map<PartitionKey<P>, Partition<V>>> localMaps = new HashMap<>();
+            for (int i = 0; i <= MASK; i++) {
+                localMaps.put(i, new HashMap<>());
+            }
+            this.maps = localMaps;
+        }
+
+        @Override
+        protected Partition<V> getPartition(final PartitionKey<P> partitionKey, final Cons<V> queue) {
+            final Map<PartitionKey<P>, Partition<V>> map = this.maps.get(partitionKey.hashCode() & MASK);
+            synchronized (map) {
+                final Partition<V> existing = map.get(partitionKey);
+                if (existing == null) {
+                    map.put(partitionKey, new Partition<>(queue));
+                }
+                return existing;
+            }
+        }
+
+        @Override
+        protected void remove(final PartitionKey<P> partitionKey) {
+            final Map<PartitionKey<P>, Partition<V>> map = this.maps.get(partitionKey.hashCode() & MASK);
+            synchronized (map) {
+                map.remove(partitionKey);
+            }
         }
     }
 }

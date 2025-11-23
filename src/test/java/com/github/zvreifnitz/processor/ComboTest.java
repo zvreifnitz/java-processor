@@ -25,10 +25,11 @@ public class ComboTest {
             final Executor executor,
             final ConcurrentLinkedQueue<Item> results,
             final boolean includeBuffers,
-            final boolean compositeKey) {
+            final boolean compositeKey,
+            final FakeWorkType workType) {
         final OrderedProcessor<String, Item> tertiaryProcessor =
                 OrderedProcessor.defaultBuilder(String.class, Item.class)
-                        .setWorker(new TertiaryWorker(results))
+                        .setWorker(new TertiaryWorker(results, workType))
                         .setExtractor(compositeKey ?
                                 item -> item.primaryId + "-" + item.secondaryId + "-" + item.tertiaryId
                                 : item -> item.tertiaryId)
@@ -45,7 +46,7 @@ public class ComboTest {
                 : tertiaryProcessor;
         final OrderedProcessor<String, Item> secondaryProcessor =
                 OrderedProcessor.defaultBuilder(String.class, Item.class)
-                        .setWorker(new SecondaryWorker(tertiaryProcessorBuffer))
+                        .setWorker(new SecondaryWorker(tertiaryProcessorBuffer, workType))
                         .setExtractor(compositeKey ?
                                 item -> item.primaryId + "-" + item.secondaryId
                                 : item -> item.secondaryId)
@@ -61,17 +62,28 @@ public class ComboTest {
                         .build()
                 : secondaryProcessor;
         return OrderedProcessor.defaultBuilder(String.class, Item.class)
-                .setWorker(new PrimaryWorker(secondaryProcessorBuffer))
+                .setWorker(new PrimaryWorker(secondaryProcessorBuffer, workType))
                 .setExtractor(item -> item.primaryId)
                 .setExecutor(executor)
                 .setOnclose(secondaryProcessorBuffer::close)
                 .build();
     }
 
-    public static void fakeWork() {
+    private static void fakeWork(final FakeWorkType workType) {
         try {
-            if (ThreadLocalRandom.current().nextDouble() < 0.1) {
-                Thread.yield();
+            switch (workType) {
+                case YIELD -> {
+                    if (ThreadLocalRandom.current().nextDouble() < 0.1) {
+                        Thread.yield();
+                    }
+                }
+                case SLEEP -> {
+                    if (ThreadLocalRandom.current().nextDouble() < 0.1) {
+                        Thread.sleep(0, 10);
+                    }
+                }
+                default -> {
+                }
             }
         } catch (final Exception ignored) {
         }
@@ -79,19 +91,31 @@ public class ComboTest {
 
     private static Stream<Arguments> testArgs() {
         final List<Arguments> result = new ArrayList<>();
-        result.add(arguments(named("non-buffered", false), named("singleKey", false)));
-        result.add(arguments(named("buffered", true), named("singleKey", false)));
-        result.add(arguments(named("non-buffered", false), named("compositeKey", true)));
-        result.add(arguments(named("buffered", true), named("compositeKey", true)));
+        for (final var executorArg : List.of(
+                named("virtualThreadPool", Executors.newVirtualThreadPerTaskExecutor()),
+                named("forkJoinPool", ForkJoinPool.commonPool())))
+            for (final var bufferedArg : List.of(
+                    named("non-buffered", false),
+                    named("buffered", true)))
+                for (final var compositeArg : List.of(
+                        named("singleKey", false),
+                        named("compositeKey", true)))
+                    for (final var workTypeArg : Arrays.stream(FakeWorkType.values())
+                            .map(wt -> named(wt.name().toLowerCase(), wt))
+                            .toList())
+                        result.add(arguments(executorArg, bufferedArg, compositeArg, workTypeArg));
         return result.stream();
     }
 
     @ParameterizedTest
     @MethodSource("testArgs")
-    void orderedTest_virtual(final boolean includeBuffers, final boolean compositeKey) {
+    void orderedTest(
+            final Executor executor,
+            final boolean includeBuffers,
+            final boolean compositeKey,
+            final FakeWorkType workType) {
         final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        final Executor executor = Executors.newVirtualThreadPerTaskExecutor();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey)) {
+        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey, workType)) {
             for (int value = 0; value < TOTAL; value++) {
                 processor.enqueue(new Item(
                         "" + (value % PRIMARY),
@@ -119,10 +143,13 @@ public class ComboTest {
 
     @ParameterizedTest
     @MethodSource("testArgs")
-    void randomTest_virtual(final boolean includeBuffers, final boolean compositeKey) {
+    void randomTest(
+            final Executor executor,
+            final boolean includeBuffers,
+            final boolean compositeKey,
+            final FakeWorkType workType) {
         final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        final Executor executor = Executors.newVirtualThreadPerTaskExecutor();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey)) {
+        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey, workType)) {
             for (int value = 0; value < TOTAL; value++) {
                 processor.enqueue(new Item(
                         "" + ThreadLocalRandom.current().nextInt(PRIMARY),
@@ -147,95 +174,40 @@ public class ComboTest {
         }
     }
 
-    @ParameterizedTest
-    @MethodSource("testArgs")
-    void orderedTest_pool(final boolean includeBuffers, final boolean compositeKey) {
-        final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        final Executor executor = ForkJoinPool.commonPool();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey)) {
-            for (int value = 0; value < TOTAL; value++) {
-                processor.enqueue(new Item(
-                        "" + (value % PRIMARY),
-                        "" + (value % SECONDARY),
-                        "" + (value % TERTIARY),
-                        value));
-            }
-        }
-
-        assertEquals(TOTAL, results.size());
-        final Map<String, List<Integer>> checkLists = new HashMap<>();
-        for (final var item : results) {
-            final List<Integer> list = checkLists.computeIfAbsent(
-                    item.primaryId + "-" + item.secondaryId + "-" + item.tertiaryId,
-                    k -> new ArrayList<>());
-            list.add(item.value);
-        }
-        for (final var list : checkLists.values()) {
-            assertEquals(NUM_OF_ITEMS, list.size());
-            for (int i = 1; i < list.size(); i++) {
-                assertTrue(list.get(i - 1) < list.get(i));
-            }
-        }
+    enum FakeWorkType {
+        NONE,
+        YIELD,
+        SLEEP
     }
 
-    @ParameterizedTest
-    @MethodSource("testArgs")
-    void randomTest_pool(final boolean includeBuffers, final boolean compositeKey) {
-        final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        final Executor executor = ForkJoinPool.commonPool();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey)) {
-            for (int value = 0; value < TOTAL; value++) {
-                processor.enqueue(new Item(
-                        "" + ThreadLocalRandom.current().nextInt(PRIMARY),
-                        "" + ThreadLocalRandom.current().nextInt(SECONDARY),
-                        "" + ThreadLocalRandom.current().nextInt(TERTIARY),
-                        value));
-            }
-        }
-
-        assertEquals(TOTAL, results.size());
-        final Map<String, List<Integer>> checkLists = new HashMap<>();
-        for (final var item : results) {
-            final List<Integer> list = checkLists.computeIfAbsent(
-                    item.primaryId + "-" + item.secondaryId + "-" + item.tertiaryId,
-                    k -> new ArrayList<>());
-            list.add(item.value);
-        }
-        for (final var list : checkLists.values()) {
-            for (int i = 1; i < list.size(); i++) {
-                assertTrue(list.get(i - 1) < list.get(i));
-            }
-        }
-    }
-
-    public record PrimaryWorker(OrderedProcessor<String, Item> secondaryProcessor)
+    record PrimaryWorker(OrderedProcessor<String, Item> secondaryProcessor, FakeWorkType workType)
             implements OrderedProcessorWorker<String, Item> {
         @Override
         public void process(final String partition, final Item value, final Iterable<Item> remaining) {
-            fakeWork();
+            fakeWork(workType);
             secondaryProcessor.enqueue(value);
         }
     }
 
-    public record SecondaryWorker(OrderedProcessor<String, Item> tertiaryProcessor)
+    record SecondaryWorker(OrderedProcessor<String, Item> tertiaryProcessor, FakeWorkType workType)
             implements OrderedProcessorWorker<String, Item> {
         @Override
         public void process(final String partition, final Item value, final Iterable<Item> remaining) {
-            fakeWork();
+            fakeWork(workType);
             tertiaryProcessor.enqueue(value);
         }
     }
 
-    public record TertiaryWorker(ConcurrentLinkedQueue<Item> results)
+    record TertiaryWorker(ConcurrentLinkedQueue<Item> results, FakeWorkType workType)
             implements OrderedProcessorWorker<String, Item> {
         @Override
         public void process(final String partition, final Item value, final Iterable<Item> remaining) {
-            fakeWork();
+            fakeWork(workType);
             results.add(value);
         }
     }
 
-    public record BufferWorker(OrderedProcessor<String, Item> processor)
+    record BufferWorker(OrderedProcessor<String, Item> processor)
             implements OrderedProcessorWorker<String, Item> {
         @Override
         public void process(final String partition, final Item value, final Iterable<Item> remaining) {
@@ -248,6 +220,6 @@ public class ComboTest {
         }
     }
 
-    public record Item(String primaryId, String secondaryId, String tertiaryId, int value) {
+    record Item(String primaryId, String secondaryId, String tertiaryId, int value) {
     }
 }

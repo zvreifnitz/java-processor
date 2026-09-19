@@ -92,6 +92,9 @@ public class ComboTest {
     private static Stream<Arguments> testArgs() {
         final List<Arguments> result = new ArrayList<>();
         for (final var executorArg : List.of(
+                named("sameThread", (Executor) Runnable::run),
+                named("singleThread", Executors.newSingleThreadExecutor()),
+                named("threadPool", Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())),
                 named("virtualThreadPool", Executors.newVirtualThreadPerTaskExecutor()),
                 named("forkJoinPool", ForkJoinPool.commonPool())))
             for (final var bufferedArg : List.of(

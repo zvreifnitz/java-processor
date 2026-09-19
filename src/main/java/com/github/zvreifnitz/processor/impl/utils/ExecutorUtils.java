@@ -20,50 +20,55 @@ public class ExecutorUtils {
         return ParallelismProvider.PARALLELISM;
     }
 
-    public static Boolean canStackOverflow(final Executor executor) {
+    public static ExecutorInfo getInfo(final Executor executor) {
         try {
             if (executor == null) {
-                return null;
+                return new ExecutorInfo();
             }
-            final StackFrameCountCheck check = new StackFrameCountCheck(executor);
-            executor.execute(check);
-            return check.get();
+            final InfoCollector collector = new InfoCollector(executor);
+            executor.execute(collector);
+            return collector.get();
         } catch (final Exception ignored) {
-            return null;
+            return new ExecutorInfo();
         }
     }
 
-    private static final class StackFrameCountCheck implements Runnable, Future<Boolean> {
+    private static final class InfoCollector implements Runnable, Future<ExecutorInfo> {
 
         private final Executor executor;
         private final int depth;
-        private final ConcurrentHashMap<Integer, Integer> result;
+        private final ConcurrentHashMap<Integer, Integer> stackLengths;
+        private final ConcurrentHashMap<Integer, Boolean> virtualThreads;
         private final CountDownLatch latch;
 
-        public StackFrameCountCheck(final Executor executor) {
-            this(executor, 0, new CountDownLatch(1), new ConcurrentHashMap<>());
+        public InfoCollector(final Executor executor) {
+            this(executor, 0, new CountDownLatch(1), new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
         }
 
-        private StackFrameCountCheck(
+        private InfoCollector(
                 final Executor executor,
                 final int depth,
                 final CountDownLatch latch,
-                final ConcurrentHashMap<Integer, Integer> result) {
+                final ConcurrentHashMap<Integer, Integer> stackLengths,
+                final ConcurrentHashMap<Integer, Boolean> virtualThreads) {
             this.executor = executor;
             this.depth = depth;
             this.latch = latch;
-            this.result = result;
+            this.stackLengths = stackLengths;
+            this.virtualThreads = virtualThreads;
         }
 
-        private StackFrameCountCheck fork() {
-            return new StackFrameCountCheck(executor, depth + 1, this.latch, this.result);
+        private InfoCollector fork() {
+            return new InfoCollector(executor, depth + 1, this.latch, this.stackLengths, this.virtualThreads);
         }
 
         @Override
         public void run() {
             try {
-                final int stack = Thread.currentThread().getStackTrace().length;
-                this.result.put(depth, stack);
+                final var thread = Thread.currentThread();
+                final int stack = thread.getStackTrace().length;
+                this.stackLengths.put(depth, stack);
+                this.virtualThreads.put(depth, thread.isVirtual());
                 if (this.depth < 3) {
                     this.executor.execute(fork());
                 } else {
@@ -90,26 +95,34 @@ public class ExecutorUtils {
         }
 
         @Override
-        public Boolean get() throws InterruptedException {
+        public ExecutorInfo get() throws InterruptedException {
             this.latch.await();
-            return this.checkStackCounts();
+            return this.collectInfo();
         }
 
         @Override
-        public Boolean get(final long timeout, final TimeUnit unit) throws InterruptedException, TimeoutException {
+        public ExecutorInfo get(final long timeout, final TimeUnit unit) throws InterruptedException, TimeoutException {
             if (this.latch.await(timeout, unit)) {
-                return this.checkStackCounts();
+                return this.collectInfo();
             }
             throw new TimeoutException();
         }
 
-        private Boolean checkStackCounts() {
-            if (this.result.size() != 4) {
+        private ExecutorInfo collectInfo() {
+            final Boolean overflow = this.calculateCanOverflow();
+            final Boolean virtual = this.calculateIsVirtual();
+            return new ExecutorInfo(
+                    Boolean.FALSE.equals(overflow),
+                    !Boolean.FALSE.equals(virtual));
+        }
+
+        private Boolean calculateCanOverflow() {
+            if (this.stackLengths.size() != 4) {
                 return null;
             }
             int maxHead = Integer.MIN_VALUE;
             int maxTail = Integer.MIN_VALUE;
-            for (final Map.Entry<Integer, Integer> entry : this.result.entrySet()) {
+            for (final Map.Entry<Integer, Integer> entry : this.stackLengths.entrySet()) {
                 if (entry.getKey() < 2) {
                     maxHead = Math.max(maxHead, entry.getValue());
                 } else {
@@ -117,6 +130,22 @@ public class ExecutorUtils {
                 }
             }
             return maxHead < maxTail;
+        }
+
+        private Boolean calculateIsVirtual() {
+            if (this.virtualThreads.size() != 4) {
+                return null;
+            }
+            int noCount = 0;
+            int yesCount = 0;
+            for (final Boolean value : this.virtualThreads.values()) {
+                if (Boolean.TRUE.equals(value)) {
+                    yesCount++;
+                } else {
+                    noCount++;
+                }
+            }
+            return yesCount > noCount;
         }
     }
 

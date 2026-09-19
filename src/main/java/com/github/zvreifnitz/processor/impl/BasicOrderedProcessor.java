@@ -32,7 +32,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         super(executor, afterClose);
         this.worker = requireNonNull(worker);
         this.extractor = extractor == null ? new EqualsExtractor<>() : new FunctionExtractor<>(extractor);
-        this.partitions = new SyncPartitionQueue<>();
+        this.partitions = this.getInfo().virtualThread() ? new SyncPartitionQueue<>() : new ChmPartitionQueue<>();
         this.counter = new LongAdder();
     }
 
@@ -135,7 +135,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
 
         @Override
         public void run() {
-            if (this.parent.isRecursionSupported()) {
+            if (this.parent.getInfo().recursionSafe()) {
                 final Cons<V> remainingQueue = this.processItem(this.queue, this.data);
                 if (remainingQueue != null) {
                     this.queue = remainingQueue;

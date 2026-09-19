@@ -1,6 +1,7 @@
 package com.github.zvreifnitz.processor.impl.base;
 
 import com.github.zvreifnitz.processor.Processor;
+import com.github.zvreifnitz.processor.impl.utils.ExecutorInfo;
 import com.github.zvreifnitz.processor.impl.utils.ExecutorUtils;
 
 import java.util.concurrent.Executor;
@@ -11,8 +12,8 @@ public abstract class ExecutorProcessor<V> extends ConsumerProcessor<V>
         implements Processor<V>, Consumer<V>, AutoCloseable {
 
     private final Executor executor;
+    private final ExecutorInfo info;
     private final boolean closeExecutor;
-    private final boolean recursionSupported;
     private final Runnable afterClose;
 
     private volatile boolean stopped = false;
@@ -20,7 +21,7 @@ public abstract class ExecutorProcessor<V> extends ConsumerProcessor<V>
     protected ExecutorProcessor(final Executor executor, final Runnable afterClose) {
         this.executor = executor != null ? executor : ExecutorUtils.defaultWorkStealingPool();
         this.closeExecutor = false;
-        this.recursionSupported = Boolean.FALSE.equals(ExecutorUtils.canStackOverflow(this.executor));
+        this.info = ExecutorUtils.getInfo(this.executor);
         this.afterClose = afterClose;
     }
 
@@ -46,8 +47,8 @@ public abstract class ExecutorProcessor<V> extends ConsumerProcessor<V>
         }
     }
 
-    protected final boolean isRecursionSupported() {
-        return this.recursionSupported;
+    protected final ExecutorInfo getInfo() {
+        return this.info;
     }
 
     protected void doClose() {

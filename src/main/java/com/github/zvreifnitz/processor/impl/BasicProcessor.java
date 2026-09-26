@@ -8,7 +8,9 @@ import com.github.zvreifnitz.processor.impl.utils.ProcessorFuture;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 
 import static java.util.Objects.requireNonNull;
@@ -51,7 +53,7 @@ public final class BasicProcessor<V> extends ExecutorProcessor<V>
     @Override
     protected void doClose() {
         while (this.count() != 0) {
-            Thread.yield();
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
         }
         super.doClose();
     }

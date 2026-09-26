@@ -33,121 +33,113 @@ public class ExecutorUtils {
         }
     }
 
-    private static final class InfoCollector implements Runnable, Future<ExecutorInfo> {
+    private record InfoCollector(Executor executor, int depth, ConcurrentHashMap<Integer, Integer> stackLengths,
+                                 ConcurrentHashMap<Integer, Boolean> virtualThreads,
+                                 CountDownLatch latch) implements Runnable, Future<ExecutorInfo> {
 
-        private final Executor executor;
-        private final int depth;
-        private final ConcurrentHashMap<Integer, Integer> stackLengths;
-        private final ConcurrentHashMap<Integer, Boolean> virtualThreads;
-        private final CountDownLatch latch;
+            public InfoCollector(final Executor executor) {
+                this(executor, 0, new CountDownLatch(1), new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
+            }
 
-        public InfoCollector(final Executor executor) {
-            this(executor, 0, new CountDownLatch(1), new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
-        }
+            private InfoCollector(
+                    final Executor executor,
+                    final int depth,
+                    final CountDownLatch latch,
+                    final ConcurrentHashMap<Integer, Integer> stackLengths,
+                    final ConcurrentHashMap<Integer, Boolean> virtualThreads) {
+                this(executor, depth, stackLengths, virtualThreads, latch);
+            }
 
-        private InfoCollector(
-                final Executor executor,
-                final int depth,
-                final CountDownLatch latch,
-                final ConcurrentHashMap<Integer, Integer> stackLengths,
-                final ConcurrentHashMap<Integer, Boolean> virtualThreads) {
-            this.executor = executor;
-            this.depth = depth;
-            this.latch = latch;
-            this.stackLengths = stackLengths;
-            this.virtualThreads = virtualThreads;
-        }
+            private InfoCollector fork() {
+                return new InfoCollector(executor, depth + 1, this.latch, this.stackLengths, this.virtualThreads);
+            }
 
-        private InfoCollector fork() {
-            return new InfoCollector(executor, depth + 1, this.latch, this.stackLengths, this.virtualThreads);
-        }
-
-        @Override
-        public void run() {
-            try {
-                final var thread = Thread.currentThread();
-                final int stack = thread.getStackTrace().length;
-                this.stackLengths.put(depth, stack);
-                this.virtualThreads.put(depth, thread.isVirtual());
-                if (this.depth < 3) {
-                    this.executor.execute(fork());
-                } else {
+            @Override
+            public void run() {
+                try {
+                    final var thread = Thread.currentThread();
+                    final int stack = thread.getStackTrace().length;
+                    this.stackLengths.put(depth, stack);
+                    this.virtualThreads.put(depth, thread.isVirtual());
+                    if (this.depth < 3) {
+                        this.executor.execute(fork());
+                    } else {
+                        this.latch.countDown();
+                    }
+                } catch (final Exception ignored) {
                     this.latch.countDown();
                 }
-            } catch (final Exception ignored) {
-                this.latch.countDown();
             }
-        }
 
-        @Override
-        public boolean cancel(final boolean mayInterruptIfRunning) {
-            return false;
-        }
+            @Override
+            public boolean cancel(final boolean mayInterruptIfRunning) {
+                return false;
+            }
 
-        @Override
-        public boolean isCancelled() {
-            return false;
-        }
+            @Override
+            public boolean isCancelled() {
+                return false;
+            }
 
-        @Override
-        public boolean isDone() {
-            return this.latch.getCount() == 0;
-        }
+            @Override
+            public boolean isDone() {
+                return this.latch.getCount() == 0;
+            }
 
-        @Override
-        public ExecutorInfo get() throws InterruptedException {
-            this.latch.await();
-            return this.collectInfo();
-        }
-
-        @Override
-        public ExecutorInfo get(final long timeout, final TimeUnit unit) throws InterruptedException, TimeoutException {
-            if (this.latch.await(timeout, unit)) {
+            @Override
+            public ExecutorInfo get() throws InterruptedException {
+                this.latch.await();
                 return this.collectInfo();
             }
-            throw new TimeoutException();
-        }
 
-        private ExecutorInfo collectInfo() {
-            final Boolean overflow = this.calculateCanOverflow();
-            final Boolean virtual = this.calculateIsVirtual();
-            return new ExecutorInfo(
-                    Boolean.FALSE.equals(overflow),
-                    !Boolean.FALSE.equals(virtual));
-        }
-
-        private Boolean calculateCanOverflow() {
-            if (this.stackLengths.size() != 4) {
-                return null;
-            }
-            int maxHead = Integer.MIN_VALUE;
-            int maxTail = Integer.MIN_VALUE;
-            for (final Map.Entry<Integer, Integer> entry : this.stackLengths.entrySet()) {
-                if (entry.getKey() < 2) {
-                    maxHead = Math.max(maxHead, entry.getValue());
-                } else {
-                    maxTail = Math.max(maxTail, entry.getValue());
+            @Override
+            public ExecutorInfo get(final long timeout, final TimeUnit unit) throws InterruptedException, TimeoutException {
+                if (this.latch.await(timeout, unit)) {
+                    return this.collectInfo();
                 }
+                throw new TimeoutException();
             }
-            return maxHead < maxTail;
-        }
 
-        private Boolean calculateIsVirtual() {
-            if (this.virtualThreads.size() != 4) {
-                return null;
+            private ExecutorInfo collectInfo() {
+                final Boolean overflow = this.calculateCanOverflow();
+                final Boolean virtual = this.calculateIsVirtual();
+                return new ExecutorInfo(
+                        Boolean.FALSE.equals(overflow),
+                        !Boolean.FALSE.equals(virtual));
             }
-            int noCount = 0;
-            int yesCount = 0;
-            for (final Boolean value : this.virtualThreads.values()) {
-                if (Boolean.TRUE.equals(value)) {
-                    yesCount++;
-                } else {
-                    noCount++;
+
+            private Boolean calculateCanOverflow() {
+                if (this.stackLengths.size() != 4) {
+                    return null;
                 }
+                int maxHead = Integer.MIN_VALUE;
+                int maxTail = Integer.MIN_VALUE;
+                for (final Map.Entry<Integer, Integer> entry : this.stackLengths.entrySet()) {
+                    if (entry.getKey() < 2) {
+                        maxHead = Math.max(maxHead, entry.getValue());
+                    } else {
+                        maxTail = Math.max(maxTail, entry.getValue());
+                    }
+                }
+                return maxHead < maxTail;
             }
-            return yesCount > noCount;
+
+            private Boolean calculateIsVirtual() {
+                if (this.virtualThreads.size() != 4) {
+                    return null;
+                }
+                int noCount = 0;
+                int yesCount = 0;
+                for (final Boolean value : this.virtualThreads.values()) {
+                    if (Boolean.TRUE.equals(value)) {
+                        yesCount++;
+                    } else {
+                        noCount++;
+                    }
+                }
+                return yesCount > noCount;
+            }
         }
-    }
 
     public record DelegatingExecutor(Executor delegate) implements Executor {
         @Override

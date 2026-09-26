@@ -36,8 +36,6 @@ public class BasicOrderedProcessorBuilder {
 
     public interface ExtractorSetter<P, V> {
         ExecutorSetter<P, V> setExtractor(final Function<V, P> extractor);
-
-        ExecutorSetter<P, V> useDefaultExtractor();
     }
 
     public interface ExecutorSetter<P, V> {
@@ -88,12 +86,6 @@ public class BasicOrderedProcessorBuilder {
         @Override
         public ExecutorSetter<P, V> setExtractor(final Function<V, P> extractor) {
             this.extractor = requireNonNull(extractor);
-            return this;
-        }
-
-        @Override
-        public ExecutorSetter<P, V> useDefaultExtractor() {
-            this.extractor = null;
             return this;
         }
 

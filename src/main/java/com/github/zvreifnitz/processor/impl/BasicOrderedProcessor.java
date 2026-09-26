@@ -11,6 +11,7 @@ import java.lang.invoke.VarHandle;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -20,7 +21,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         implements OrderedProcessor<P, V>, Processor<V>, Consumer<V>, AutoCloseable {
 
     private final OrderedProcessorWorker<P, V> worker;
-    private final Function<V, PartitionKey<P>> extractor;
+    private final Function<V, P> extractor;
     private final PartitionQueue<P, V> partitions;
     private final LongAdder counter;
 
@@ -31,7 +32,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
             final Runnable afterClose) {
         super(executor, afterClose);
         this.worker = requireNonNull(worker);
-        this.extractor = extractor == null ? new EqualsExtractor<>() : new FunctionExtractor<>(extractor);
+        this.extractor = requireNonNull(extractor);
         this.partitions = this.getInfo().virtualThread() ? new SyncPartitionQueue<>() : new ChmPartitionQueue<>();
         this.counter = new LongAdder();
     }
@@ -42,22 +43,26 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
 
     @Override
     public boolean enqueue(final V value) {
-        return this.enqueue(this.extractor.apply(value), new Data<>(value, null));
+        final P partitionKey = requireNonNull(this.extractor.apply(value));
+        return this.enqueue(partitionKey, new Node<>(value, null));
     }
 
     @Override
     public boolean enqueue(final P partition, final V value) {
-        return this.enqueue(new ValueKey<>(partition), new Data<>(value, null));
+        final P partitionKey = requireNonNull(partition);
+        return this.enqueue(partitionKey, new Node<>(value, null));
     }
 
     @Override
     public CompletableFuture<V> submit(final V value) {
-        return this.submit(this.extractor.apply(value), new Data<>(value, new ProcessorFuture<>()));
+        final P partitionKey = requireNonNull(this.extractor.apply(value));
+        return this.submit(partitionKey, new Node<>(value, new ProcessorFuture<>()));
     }
 
     @Override
     public CompletableFuture<V> submit(final P partition, final V value) {
-        return this.submit(new ValueKey<>(partition), new Data<>(value, new ProcessorFuture<>()));
+        final P partitionKey = requireNonNull(partition);
+        return this.submit(partitionKey, new Node<>(value, new ProcessorFuture<>()));
     }
 
     @Override
@@ -68,28 +73,27 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
     @Override
     protected void doClose() {
         while (this.count() != 0) {
-            Thread.yield();
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
         }
         super.doClose();
     }
 
-    private ProcessorFuture<V> submit(final PartitionKey<P> partitionKey, final Data<V> data) {
-        if (!this.enqueue(partitionKey, data)) {
-            data.getFuture().completeExceptionally(new RejectedExecutionException("Submitting value failed"));
+    private ProcessorFuture<V> submit(final P partitionKey, final Node<V> node) {
+        if (!this.enqueue(partitionKey, node)) {
+            node.future.completeExceptionally(new RejectedExecutionException("Submitting value failed"));
         }
-        return data.getFuture();
+        return node.future;
     }
 
-    private boolean enqueue(final PartitionKey<P> partitionKey, final Data<V> data) {
+    private boolean enqueue(final P partitionKey, final Node<V> node) {
         this.counter.increment();
-        final Cons<V> queue = new Cons<>(data);
         while (this.isOpen()) {
-            final Partition<V> partition = this.partitions.getPartition(partitionKey, queue);
+            final Partition<V> partition = this.partitions.getPartition(partitionKey, node);
             if (partition == null) {
-                this.enqueueTask(new Task<>(this, partitionKey, queue, data));
+                this.enqueueTask(new Task<>(this, partitionKey, node));
                 return true;
             }
-            if (partition.append(queue)) {
+            if (partition.append(node)) {
                 return true;
             }
         }
@@ -103,313 +107,202 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         }
     }
 
-    private record EqualsExtractor<P, V>() implements Function<V, PartitionKey<P>> {
-        @Override
-        public PartitionKey<P> apply(final V value) {
-            return new EqualsKey<>(value);
-        }
-    }
-
-    private record FunctionExtractor<P, V>(Function<V, P> extractor) implements Function<V, PartitionKey<P>> {
-        @Override
-        public PartitionKey<P> apply(final V value) {
-            return new ValueKey<>(this.extractor.apply(value));
-        }
-    }
-
-    private static final class Task<P, V> implements Runnable {
+    private static final class Task<P, V> implements Iterable<V>, Runnable {
 
         private final BasicOrderedProcessor<P, V> parent;
-        private final PartitionKey<P> key;
-        private Cons<V> queue;
-        private Data<V> data;
+        private final P key;
+        private Node<V> node;
+        private Node<V> current;
+        private List<Node<V>> doneNodes;
 
         public Task(
-                final BasicOrderedProcessor<P, V> parent, final PartitionKey<P> key,
-                final Cons<V> queue, final Data<V> data) {
+                final BasicOrderedProcessor<P, V> parent, final P key, final Node<V> node) {
             this.parent = parent;
             this.key = key;
-            this.queue = queue;
-            this.data = data;
+            this.node = node;
         }
 
         @Override
         public void run() {
             if (this.parent.getInfo().recursionSafe()) {
-                final Cons<V> remainingQueue = this.processItem(this.queue, this.data);
-                if (remainingQueue != null) {
-                    this.queue = remainingQueue;
-                    this.data = remainingQueue.getData();
+                final Node<V> remaining = this.processNode(this.node);
+                if (remaining != null) {
+                    this.node = remaining;
                     this.parent.enqueueTask(this);
                 }
             } else {
-                final Cons<V> q = this.queue;
-                final Data<V> d = this.data;
-                this.queue = null;
-                this.data = null;
-                this.processAllItems(q, d);
+                final Node<V> q = this.node;
+                this.node = null;
+                this.processAllINodes(q);
             }
         }
 
-        private void processAllItems(final Cons<V> queue, final Data<V> data) {
-            Cons<V> remainingQueue = this.processItem(queue, data);
-            while (remainingQueue != null) {
-                remainingQueue = this.processItem(remainingQueue, remainingQueue.getData());
+        private void processAllINodes(final Node<V> node) {
+            Node<V> remaining = this.processNode(node);
+            while (remaining != null) {
+                remaining = this.processNode(remaining);
             }
         }
 
-        private Cons<V> processItem(final Cons<V> queue, final Data<V> data) {
-            this.processData(queue, data);
-            this.parent.counter.add(data.getDoneCount());
-            return this.getRemainingQueueLoop(queue);
+        private Node<V> processNode(final Node<V> node) {
+            this.execute(node);
+            return this.getRemainingNodeLoop(node);
         }
 
-        private void processData(final Iterable<V> queue, final Data<V> data) {
+        private void execute(final Node<V> node) {
             try {
-                final P key = this.key.getPartition();
-                this.parent.worker.process(key, data.getValue(), queue);
-                this.complete(data);
+                this.current = node;
+                this.parent.worker.process(this.key, node.value, this);
+                this.complete();
             } catch (final Exception e) {
-                this.completeExceptionally(data, e);
+                this.completeExceptionally(e);
             }
         }
 
-        private void complete(final Fields<V> data) {
-            final ArrayList<Fields<V>> submits = data.getDoneSubmits();
-            if (submits != null) {
-                for (final var d : submits) {
-                    d.getFuture().complete(d.getValue());
-                }
-            }
-        }
-
-        private void completeExceptionally(final Fields<V> data, final Exception e) {
-            final ArrayList<Fields<V>> submits = data.getDoneSubmits();
-            if (submits != null) {
-                for (final var d : submits) {
-                    d.getFuture().completeExceptionally(e);
-                }
-            }
-        }
-
-        private Cons<V> getRemainingQueueLoop(final Cons<V> queue) {
-            Cons<V> remainingQueue = queue;
+        private Node<V> getRemainingNodeLoop(final Node<V> node) {
+            Node<V> remaining = node;
             do {
-                remainingQueue = getRemainingQueue(remainingQueue);
-            } while (remainingQueue != null && remainingQueue.getData().isDone());
-            return remainingQueue;
+                remaining = getRemainingNode(remaining);
+            } while (remaining != null && remaining.done);
+            return remaining;
         }
 
-        private Cons<V> getRemainingQueue(final Cons<V> queue) {
-            final Queue<V> existingQueue = queue.getRemainingQueue();
-            final Queue<V> appendedQueue = existingQueue == null ? queue.tryAppend(Nil.nil()) : existingQueue;
-            if (appendedQueue instanceof Cons<V> q) {
-                return q;
+        private Node<V> getRemainingNode(final Node<V> node) {
+            final Queue<V> existing = node.getRemainingQueue();
+            final Queue<V> appended = existing == null ? node.tryAppend(Nil.nil()) : existing;
+            if (appended instanceof Node<V> n) {
+                return n;
             }
             this.parent.partitions.remove(this.key);
             return null;
         }
-    }
-
-    private static sealed abstract class PartitionKey<P> permits ValueKey, EqualsKey {
-        public abstract P getPartition();
-    }
-
-    private static final class ValueKey<P> extends PartitionKey<P> {
-
-        private final P key;
-
-        public ValueKey(final P key) {
-            this.key = key;
-        }
 
         @Override
-        public P getPartition() {
-            return this.key;
+        public Iterator<V> iterator() {
+            if (this.doneNodes == null) {
+                this.doneNodes = new ArrayList<>();
+            }
+            return new QueueIterator<>(this);
         }
 
-        @Override
-        public boolean equals(final Object object) {
-            if (this == object) return true;
-            if (object == null || getClass() != object.getClass()) return false;
-
-            final ValueKey<?> other = (ValueKey<?>) object;
-            return Objects.equals(this.key, other.key);
+        public void complete() {
+            if (this.current.future != null) {
+                this.current.future.complete(this.current.value);
+            }
+            int count = 1;
+            if (this.doneNodes != null) {
+                for (final Node<V> node : this.doneNodes) {
+                    count++;
+                    node.done = true;
+                    if (node.future != null) {
+                        node.future.complete(node.value);
+                    }
+                }
+                this.doneNodes = null;
+            }
+            this.parent.counter.add(-count);
         }
 
-        @Override
-        public int hashCode() {
-            return this.key == null ? -827727347 : this.key.hashCode();
-        }
-    }
-
-    private static final class EqualsKey<P, V> extends PartitionKey<P> {
-
-        private final V value;
-
-        public EqualsKey(final V value) {
-            this.value = value;
-        }
-
-        @Override
-        public P getPartition() {
-            return null;
-        }
-
-        @Override
-        public boolean equals(final Object object) {
-            if (this == object) return true;
-            if (object == null || getClass() != object.getClass()) return false;
-
-            final EqualsKey<?, ?> other = (EqualsKey<?, ?>) object;
-            return Objects.equals(this.value, other.value);
+        public void completeExceptionally(final Exception exception) {
+            if (this.current.future != null) {
+                this.current.future.completeExceptionally(exception);
+            }
+            int count = 1;
+            if (this.doneNodes != null) {
+                for (final Node<V> node : this.doneNodes) {
+                    count++;
+                    node.done = true;
+                    if (node.future != null) {
+                        node.future.completeExceptionally(exception);
+                    }
+                }
+                this.doneNodes = null;
+            }
+            this.parent.counter.add(-count);
         }
 
-        @Override
-        public int hashCode() {
-            return this.value == null ? -746635477 : this.value.hashCode();
+        public void addToDoneNode(final Node<V> node) {
+            this.doneNodes.add(node);
         }
     }
 
     private static final class Partition<V> {
 
-        private static final VarHandle QUEUE;
+        private static final VarHandle ROOT;
 
         static {
             try {
-                QUEUE = MethodHandles.lookup().findVarHandle(Partition.class, "queue", Cons.class);
+                ROOT = MethodHandles.lookup().findVarHandle(Partition.class, "root", Node.class);
             } catch (final ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
         }
 
         @SuppressWarnings("unused")
-        private volatile Cons<V> queue;
+        private volatile Node<V> root;
 
-        public Partition(final Cons<V> queue) {
-            this.setQueue(queue);
+        public Partition(final Node<V> node) {
+            this.setRoot(node);
         }
 
-        public boolean append(final Cons<V> queue) {
-            final Cons<V> q = this.getQueue();
-            if (q.append(queue)) {
-                this.setQueue(queue);
+        public boolean append(final Node<V> node) {
+            final Node<V> n = this.getRoot();
+            if (n.append(node)) {
+                this.setRoot(node);
                 return true;
             }
             return false;
         }
 
-        private Cons<V> getQueue() {
-            @SuppressWarnings("unchecked") final Cons<V> queue = (Cons<V>) QUEUE.getOpaque(this);
-            return queue;
+        private Node<V> getRoot() {
+            @SuppressWarnings("unchecked") final Node<V> n = (Node<V>) ROOT.getOpaque(this);
+            return n;
         }
 
-        private void setQueue(final Cons<V> queue) {
-            QUEUE.setOpaque(this, queue);
-        }
-    }
-
-    private static abstract class Fields<V> {
-
-        private final V value;
-        private final ProcessorFuture<V> future;
-        private boolean done;
-        private int doneCount = -1;
-        private ArrayList<Fields<V>> doneSubmits;
-
-        public Fields(final V value, final ProcessorFuture<V> future) {
-            this.value = value;
-            this.future = future;
-            this.doneSubmits = future != null ? new ArrayList<>(List.of(this)) : null;
-        }
-
-        public V getValue() {
-            return this.value;
-        }
-
-        public ProcessorFuture<V> getFuture() {
-            return this.future;
-        }
-
-        public boolean isDone() {
-            return this.done;
-        }
-
-        public int getDoneCount() {
-            return this.doneCount;
-        }
-
-        public ArrayList<Fields<V>> getDoneSubmits() {
-            return this.doneSubmits;
-        }
-
-        public void markAsDone(final Fields<V> data) {
-            data.done = true;
-            if (data.future != null) {
-                ArrayList<Fields<V>> result = this.doneSubmits;
-                if (result == null) {
-                    this.doneSubmits = result = new ArrayList<>();
-                }
-                result.add(data);
-            }
-            this.doneCount--;
+        private void setRoot(final Node<V> node) {
+            ROOT.setOpaque(this, node);
         }
     }
 
     @SuppressWarnings("unused")
-    private static final class Data<V> extends Fields<V> {
-
-        private volatile long p7;
-        private volatile long p8;
-        private volatile long p9;
-        private volatile long p10;
-        private volatile long p11;
-
-        public Data(final V value, final ProcessorFuture<V> future) {
-            super(value, future);
-        }
+    private static sealed abstract class Queue<V> permits Node, Nil {
     }
 
-    @SuppressWarnings("unused")
-    private static sealed abstract class Queue<V> permits Cons, Nil {
-    }
-
-    private static final class Cons<V> extends Queue<V> implements Iterable<V> {
+    private static final class Node<V> extends Queue<V> {
 
         private static final VarHandle REMAINING_QUEUE;
 
         static {
             try {
-                REMAINING_QUEUE = MethodHandles.lookup().findVarHandle(Cons.class, "remainingQueue", Queue.class);
+                REMAINING_QUEUE = MethodHandles.lookup().findVarHandle(Node.class, "remainingQueue", Queue.class);
             } catch (final ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
         }
 
-        private final Data<V> data;
+        private final V value;
+        private final ProcessorFuture<V> future;
         @SuppressWarnings("unused")
         private volatile Queue<V> remainingQueue;
+        private boolean done = false;
 
-        public Cons(final Data<V> data) {
-            this.data = data;
-        }
-
-        public Data<V> getData() {
-            return this.data;
+        public Node(final V value, final ProcessorFuture<V> future) {
+            this.value = value;
+            this.future = future;
         }
 
         public Queue<V> getRemainingQueue() {
-            @SuppressWarnings("unchecked") final Queue<V> result = (Queue<V>) REMAINING_QUEUE.getAcquire(this);
-            return result;
+            @SuppressWarnings("unchecked") final Queue<V> q = (Queue<V>) REMAINING_QUEUE.getAcquire(this);
+            return q;
         }
 
-        public boolean append(final Cons<V> queue) {
-            Cons<V> current = this;
+        public boolean append(final Node<V> node) {
+            Node<V> current = this;
             while (true) {
                 final Queue<V> existingQueue = current.getRemainingQueue();
-                final Queue<V> appendedQueue = existingQueue == null ? current.tryAppend(queue) : existingQueue;
-                if (appendedQueue instanceof Cons<V> q) {
-                    current = q;
+                final Queue<V> appendedQueue = existingQueue == null ? current.tryAppend(node) : existingQueue;
+                if (appendedQueue instanceof Node<V> n) {
+                    current = n;
                     continue;
                 }
                 return appendedQueue == null;
@@ -417,14 +310,9 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         }
 
         public Queue<V> tryAppend(final Queue<V> queue) {
-            @SuppressWarnings("unchecked") final Queue<V> result =
+            @SuppressWarnings("unchecked") final Queue<V> q =
                     (Queue<V>) REMAINING_QUEUE.compareAndExchangeRelease(this, null, queue);
-            return result;
-        }
-
-        @Override
-        public Iterator<V> iterator() {
-            return new QueueIterator<>(this);
+            return q;
         }
     }
 
@@ -440,29 +328,35 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
 
     private static final class QueueIterator<V> implements Iterator<V> {
 
-        private final Data<V> root;
-        private Cons<V> queue;
-        private Data<V> data;
+        private final Task<?, V> parent;
+        private Node<V> node;
         private boolean removeAllowed;
-        private Cons<V> cached;
+        private Node<V> cached;
 
-        public QueueIterator(final Cons<V> queue) {
-            this.queue = queue;
-            this.root = this.data = queue.getData();
+        public QueueIterator(final Task<?, V> parent) {
+            this.parent = parent;
+            this.node = parent.current;
         }
 
         @Override
         public boolean hasNext() {
-            return this.getNextCache() != null;
+            if (this.cached != null) {
+                return true;
+            }
+            this.cached = this.getNextNode();
+            return this.cached != null;
         }
 
         @Override
         public V next() {
-            final Cons<V> remainingQueue = this.getCacheNext();
-            final boolean nextFound = this.removeAllowed = remainingQueue != null;
-            if (nextFound) {
-                this.queue = remainingQueue;
-                return (this.data = remainingQueue.getData()).getValue();
+            if (this.cached == null) {
+                this.cached = this.getNextNode();
+            }
+            if (this.cached != null) {
+                this.removeAllowed = true;
+                this.node = this.cached;
+                this.cached = this.getNextNode();
+                return this.node.value;
             }
             throw new NoSuchElementException();
         }
@@ -471,50 +365,40 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         public void remove() {
             if (this.removeAllowed) {
                 this.removeAllowed = false;
-                this.root.markAsDone(this.data);
+                this.parent.addToDoneNode(this.node);
             } else {
                 throw new IllegalStateException();
             }
         }
 
-        private Cons<V> getNextCache() {
-            return this.cached = this.getRemainingQueue();
-        }
-
-        private Cons<V> getCacheNext() {
-            final Cons<V> remainingQueue = this.cached;
-            this.cached = null;
-            return remainingQueue != null ? remainingQueue : this.getRemainingQueue();
-        }
-
-        private Cons<V> getRemainingQueue() {
-            Cons<V> remainingQueue = this.queue;
+        private Node<V> getNextNode() {
+            Node<V> next = this.node;
             do {
-                remainingQueue = remainingQueue.getRemainingQueue() instanceof Cons<V> q ? q : null;
-            } while (remainingQueue != null && remainingQueue.getData().isDone());
-            return remainingQueue;
+                next = next.getRemainingQueue() instanceof Node<V> n ? n : null;
+            } while (next != null && next.done);
+            return next;
         }
     }
 
     private static sealed abstract class PartitionQueue<P, V> permits ChmPartitionQueue, SyncPartitionQueue {
 
-        protected abstract Partition<V> getPartition(final PartitionKey<P> partitionKey, final Cons<V> queue);
+        protected abstract Partition<V> getPartition(final P partitionKey, final Node<V> queue);
 
-        protected abstract void remove(final PartitionKey<P> partitionKey);
+        protected abstract void remove(final P partitionKey);
     }
 
     private static final class ChmPartitionQueue<P, V> extends PartitionQueue<P, V> {
 
-        private final ConcurrentMap<PartitionKey<P>, Partition<V>> partitions = new ConcurrentHashMap<>();
+        private final ConcurrentMap<P, Partition<V>> partitions = new ConcurrentHashMap<>();
 
         @Override
-        protected Partition<V> getPartition(final PartitionKey<P> partitionKey, final Cons<V> queue) {
+        protected Partition<V> getPartition(final P partitionKey, final Node<V> queue) {
             final Partition<V> existing = this.partitions.get(partitionKey);
             return existing != null ? existing : this.partitions.putIfAbsent(partitionKey, new Partition<>(queue));
         }
 
         @Override
-        protected void remove(final PartitionKey<P> partitionKey) {
+        protected void remove(final P partitionKey) {
             this.partitions.remove(partitionKey);
         }
     }
@@ -522,19 +406,19 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
     private static final class SyncPartitionQueue<P, V> extends PartitionQueue<P, V> {
 
         private static final int MASK = 127;
-        private final Map<Integer, Map<PartitionKey<P>, Partition<V>>> maps;
+        private final Map<P, Partition<V>>[] maps;
 
         private SyncPartitionQueue() {
-            final Map<Integer, Map<PartitionKey<P>, Partition<V>>> localMaps = new HashMap<>();
+            @SuppressWarnings("unchecked") final Map<P, Partition<V>>[] local = (Map<P, Partition<V>>[]) new Map<?, ?>[MASK + 1];
             for (int i = 0; i <= MASK; i++) {
-                localMaps.put(i, new HashMap<>());
+                local[i] = new HashMap<>();
             }
-            this.maps = localMaps;
+            this.maps = local;
         }
 
         @Override
-        protected Partition<V> getPartition(final PartitionKey<P> partitionKey, final Cons<V> queue) {
-            final Map<PartitionKey<P>, Partition<V>> map = this.maps.get(partitionKey.hashCode() & MASK);
+        protected Partition<V> getPartition(final P partitionKey, final Node<V> queue) {
+            final Map<P, Partition<V>> map = this.maps[partitionKey.hashCode() & MASK];
             synchronized (map) {
                 final Partition<V> existing = map.get(partitionKey);
                 if (existing == null) {
@@ -545,8 +429,8 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
         }
 
         @Override
-        protected void remove(final PartitionKey<P> partitionKey) {
-            final Map<PartitionKey<P>, Partition<V>> map = this.maps.get(partitionKey.hashCode() & MASK);
+        protected void remove(final P partitionKey) {
+            final Map<P, Partition<V>> map = this.maps[partitionKey.hashCode() & MASK];
             synchronized (map) {
                 map.remove(partitionKey);
             }

@@ -6,6 +6,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -79,7 +80,7 @@ public class ComboTest {
                 }
                 case SLEEP -> {
                     if (ThreadLocalRandom.current().nextDouble() < 0.1) {
-                        Thread.sleep(0, 10);
+                        LockSupport.parkNanos(10);
                     }
                 }
                 default -> {

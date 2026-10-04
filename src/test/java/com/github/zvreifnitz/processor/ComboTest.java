@@ -323,6 +323,7 @@ public class ComboTest {
                         closeable.close();
                     }
                 }
+                this.createdExecutors.clear();
             } catch (final Exception ignored) {
             }
         }

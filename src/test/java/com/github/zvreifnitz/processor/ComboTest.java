@@ -5,8 +5,12 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -23,28 +27,29 @@ public class ComboTest {
     private static final int TOTAL = PRIMARY * SECONDARY * TERTIARY * NUM_OF_ITEMS;
 
     private static OrderedProcessor<String, Item> buildProcessor(
-            final Executor executor,
+            final ExecutorProvider executorProvider,
             final int size,
             final ConcurrentLinkedQueue<Item> results,
             final boolean includeBuffers,
             final boolean compositeKey,
             final FakeWorkType workType) {
+        final boolean keepOrigSize = executorProvider.getExecutor() == null;
         final OrderedProcessor<String, Item> tertiaryProcessor =
                 OrderedProcessor.defaultBuilder(String.class, Item.class)
                         .setWorker(new TertiaryWorker(results, workType))
                         .setExtractor(compositeKey ?
                                 item -> item.primaryId + "-" + item.secondaryId + "-" + item.tertiaryId
                                 : item -> item.tertiaryId)
-                        .setSize(includeBuffers ? 0 : size * 4)
-                        .setExecutor(executor)
-                        .useDefaultOnClose()
+                        .setSize(keepOrigSize ? size : includeBuffers ? 0 : size * 4)
+                        .setExecutor(executorProvider.get())
+                        .setOnclose(executorProvider)
                         .build();
         final OrderedProcessor<String, Item> tertiaryProcessorBuffer = includeBuffers ?
                 OrderedProcessor.defaultBuilder(String.class, Item.class)
                         .setWorker(new BufferWorker(tertiaryProcessor))
                         .setExtractor(item -> "")
-                        .setUnbounded()
-                        .setExecutor(executor)
+                        .setSize(keepOrigSize ? size : 0)
+                        .setExecutor(executorProvider.get())
                         .setOnclose(tertiaryProcessor::close)
                         .build()
                 : tertiaryProcessor;
@@ -54,16 +59,16 @@ public class ComboTest {
                         .setExtractor(compositeKey ?
                                 item -> item.primaryId + "-" + item.secondaryId
                                 : item -> item.secondaryId)
-                        .setSize(includeBuffers ? 0 : size * 2)
-                        .setExecutor(executor)
+                        .setSize(keepOrigSize ? size : includeBuffers ? 0 : size * 2)
+                        .setExecutor(executorProvider.get())
                         .setOnclose(tertiaryProcessorBuffer::close)
                         .build();
         final OrderedProcessor<String, Item> secondaryProcessorBuffer = includeBuffers ?
                 OrderedProcessor.defaultBuilder(String.class, Item.class)
                         .setWorker(new BufferWorker(secondaryProcessor))
                         .setExtractor(item -> "")
-                        .setUnbounded()
-                        .setExecutor(executor)
+                        .setSize(keepOrigSize ? size : 0)
+                        .setExecutor(executorProvider.get())
                         .setOnclose(secondaryProcessor::close)
                         .build()
                 : secondaryProcessor;
@@ -71,7 +76,7 @@ public class ComboTest {
                 .setWorker(new PrimaryWorker(secondaryProcessorBuffer, workType))
                 .setExtractor(item -> item.primaryId)
                 .setSize(size)
-                .setExecutor(executor)
+                .setExecutor(executorProvider.get())
                 .setOnclose(secondaryProcessorBuffer::close)
                 .build();
     }
@@ -103,13 +108,13 @@ public class ComboTest {
     @ParameterizedTest
     @MethodSource("testArgs")
     void orderedTest(
-            final Executor executor,
+            final ExecutorProvider executorProvider,
             final int size,
             final boolean includeBuffers,
             final boolean compositeKey,
             final FakeWorkType workType) {
         final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, size, results, includeBuffers, compositeKey, workType)) {
+        try (final OrderedProcessor<String, Item> processor = buildProcessor(executorProvider, size, results, includeBuffers, compositeKey, workType)) {
             for (int value = 0; value < TOTAL; value++) {
                 while (!processor.enqueue(new Item(
                         "" + (value % PRIMARY),
@@ -140,13 +145,13 @@ public class ComboTest {
     @ParameterizedTest
     @MethodSource("testArgs")
     void randomTest(
-            final Executor executor,
+            final ExecutorProvider executorProvider,
             final int size,
             final boolean includeBuffers,
             final boolean compositeKey,
             final FakeWorkType workType) {
         final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, size, results, includeBuffers, compositeKey, workType)) {
+        try (final OrderedProcessor<String, Item> processor = buildProcessor(executorProvider, size, results, includeBuffers, compositeKey, workType)) {
             for (int value = 0; value < TOTAL; value++) {
                 while (!processor.enqueue(new Item(
                         "" + ThreadLocalRandom.current().nextInt(PRIMARY),
@@ -236,26 +241,95 @@ public class ComboTest {
 
         static {
             final List<Arguments> result = new ArrayList<>();
+            final int maxPoolSize = Math.max(7, Runtime.getRuntime().availableProcessors());
+
             for (final var executorArg : List.of(
-                    named("sameThread", (Executor) Runnable::run),
-                    named("singleThread", Executors.newSingleThreadExecutor()),
-                    named("threadPool", Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())),
-                    named("virtualThreadPool", Executors.newVirtualThreadPerTaskExecutor()),
-                    named("forkJoinPool", ForkJoinPool.commonPool())))
-                for (final var sizeArg : List.of(
-                        named("unbounded", 0),
-                        named("bounded", 1)))
-                    for (final var bufferedArg : List.of(
-                            named("non-buffered", false),
-                            named("buffered", true)))
-                        for (final var compositeArg : List.of(
-                                named("singleKey", false),
-                                named("compositeKey", true)))
-                            for (final var workTypeArg : Arrays.stream(FakeWorkType.values())
-                                    .map(wt -> named(wt.name().toLowerCase(), wt))
-                                    .toList())
+                    named("sameThread-shared", new ExecutorProvider(true, () -> Runnable::run)),
+                    named("singleThread-shared", new ExecutorProvider(true, Executors::newSingleThreadExecutor)),
+                    named("threadPool-shared", new ExecutorProvider(true, () -> Executors.newFixedThreadPool(maxPoolSize))),
+                    named("virtualThreadPool-shared", new ExecutorProvider(true, Executors::newVirtualThreadPerTaskExecutor)),
+                    named("forkJoinPool-shared", new ExecutorProvider(true, () -> Executors.newWorkStealingPool(maxPoolSize)))))
+                for (final var bufferedArg : List.of(
+                        named("non-buffered", false),
+                        named("buffered", true)))
+                    for (final var compositeArg : List.of(
+                            named("singleKey", false),
+                            named("compositeKey", true)))
+                        for (final var workTypeArg : Arrays.stream(FakeWorkType.values())
+                                .map(wt -> named(wt.name().toLowerCase(), wt))
+                                .toList())
+                            for (final var sizeArg : List.of(
+                                    named("unbounded", 0),
+                                    named("bounded", 1)))
                                 result.add(arguments(executorArg, sizeArg, bufferedArg, compositeArg, workTypeArg));
+
+            for (final var executorArg : List.of(
+                    named("singleThread-instance", new ExecutorProvider(false, Executors::newSingleThreadExecutor)),
+                    named("threadPool-instance", new ExecutorProvider(false, () -> Executors.newFixedThreadPool(maxPoolSize))),
+                    named("forkJoinPool-instance", new ExecutorProvider(false, () -> Executors.newWorkStealingPool(maxPoolSize)))))
+                for (final var bufferedArg : List.of(
+                        named("non-buffered", false),
+                        named("buffered", true)))
+                    for (final var compositeArg : List.of(
+                            named("singleKey", false),
+                            named("compositeKey", true)))
+                        for (final var workTypeArg : Arrays.stream(FakeWorkType.values())
+                                .map(wt -> named(wt.name().toLowerCase(), wt))
+                                .toList())
+                            for (final var sizeArg : List.of(
+                                    named("unbounded", 0),
+                                    named("bounded", 1),
+                                    named("large", 1000)))
+                                result.add(arguments(executorArg, sizeArg, bufferedArg, compositeArg, workTypeArg));
+
             TEST_ARGS_LIST = result;
+        }
+    }
+
+    private static class ExecutorProvider implements Supplier<Executor>, AutoCloseable, Runnable {
+        private final Executor executor;
+        private final Supplier<Executor> executorSupplier;
+        private final ConcurrentLinkedQueue<Executor> createdExecutors = new ConcurrentLinkedQueue<>();
+
+        public ExecutorProvider(final boolean cache, final Supplier<Executor> supplier) {
+            this.executor = cache ? supplier.get() : null;
+            this.executorSupplier = cache ? null : supplier;
+        }
+
+        public Supplier<Executor> getExecutorSupplier() {
+            return executorSupplier;
+        }
+
+        public Executor getExecutor() {
+            return executor;
+        }
+
+        @Override
+        public Executor get() {
+            if (this.executor != null) {
+                return this.executor;
+            } else {
+                final var exec = this.executorSupplier.get();
+                this.createdExecutors.add(exec);
+                return exec;
+            }
+        }
+
+        @Override
+        public void close() {
+            try {
+                for (final var exec : this.createdExecutors) {
+                    if (exec instanceof AutoCloseable closeable) {
+                        closeable.close();
+                    }
+                }
+            } catch (final Exception ignored) {
+            }
+        }
+
+        @Override
+        public void run() {
+            this.close();
         }
     }
 }

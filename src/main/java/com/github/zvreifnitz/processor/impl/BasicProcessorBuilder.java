@@ -2,6 +2,7 @@ package com.github.zvreifnitz.processor.impl;
 
 import com.github.zvreifnitz.processor.Processor;
 import com.github.zvreifnitz.processor.ProcessorWorker;
+import com.github.zvreifnitz.processor.impl.utils.TaskTracker;
 
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
@@ -22,9 +23,15 @@ public class BasicProcessorBuilder {
     }
 
     public interface WorkerSetter<V> {
-        ExecutorSetter<V> setWorker(final Consumer<V> worker);
+        TaskTrackerSetter<V> setWorker(final Consumer<V> worker);
 
-        ExecutorSetter<V> setWorker(final ProcessorWorker<V> worker);
+        TaskTrackerSetter<V> setWorker(final ProcessorWorker<V> worker);
+    }
+
+    public interface TaskTrackerSetter<V> {
+        ExecutorSetter<V> setUnbounded();
+
+        ExecutorSetter<V> setSize(final int size);
     }
 
     public interface ExecutorSetter<V> {
@@ -40,9 +47,11 @@ public class BasicProcessorBuilder {
     }
 
     private static final class BuilderImpl<V>
-            implements WorkerSetter<V>, ExecutorSetter<V>, CloseSetter<V>, Builder<V> {
+            implements WorkerSetter<V>, TaskTrackerSetter<V>,
+            ExecutorSetter<V>, CloseSetter<V>, Builder<V> {
 
         private ProcessorWorker<V> worker;
+        private TaskTracker tracker;
         private Executor executor;
         private Runnable onClose;
 
@@ -72,18 +81,31 @@ public class BasicProcessorBuilder {
 
         @Override
         public Processor<V> build() {
-            return new BasicProcessor<>(worker, executor, onClose);
+            return new BasicProcessor<>(worker, tracker, executor, onClose);
         }
 
         @Override
-        public ExecutorSetter<V> setWorker(final Consumer<V> worker) {
+        public TaskTrackerSetter<V> setWorker(final Consumer<V> worker) {
             this.worker = new ConsumerAdapter<>(requireNonNull(worker));
             return this;
         }
 
         @Override
-        public ExecutorSetter<V> setWorker(final ProcessorWorker<V> worker) {
+        public TaskTrackerSetter<V> setWorker(final ProcessorWorker<V> worker) {
             this.worker = requireNonNull(worker);
+            return this;
+        }
+
+
+        @Override
+        public ExecutorSetter<V> setUnbounded() {
+            this.tracker = TaskTracker.unbounded();
+            return this;
+        }
+
+        @Override
+        public ExecutorSetter<V> setSize(final int size) {
+            this.tracker = size > 0 ? TaskTracker.bounded(size) : TaskTracker.unbounded();
             return this;
         }
     }

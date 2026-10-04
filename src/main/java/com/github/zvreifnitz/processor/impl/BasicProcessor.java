@@ -4,13 +4,11 @@ import com.github.zvreifnitz.processor.Processor;
 import com.github.zvreifnitz.processor.ProcessorWorker;
 import com.github.zvreifnitz.processor.impl.base.ExecutorProcessor;
 import com.github.zvreifnitz.processor.impl.utils.ProcessorFuture;
+import com.github.zvreifnitz.processor.impl.utils.TaskTracker;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 
 import static java.util.Objects.requireNonNull;
@@ -19,12 +17,12 @@ public final class BasicProcessor<V> extends ExecutorProcessor<V>
         implements Processor<V>, Consumer<V>, AutoCloseable {
 
     private final ProcessorWorker<V> worker;
-    private final LongAdder counter;
+    private final TaskTracker tracker;
 
-    public BasicProcessor(final ProcessorWorker<V> worker, final Executor executor, final Runnable afterClose) {
+    public BasicProcessor(final ProcessorWorker<V> worker, final TaskTracker tracker, final Executor executor, final Runnable afterClose) {
         super(executor, afterClose);
         this.worker = requireNonNull(worker);
-        this.counter = new LongAdder();
+        this.tracker = requireNonNull(tracker);
     }
 
     public static <V> BasicProcessorBuilder.WorkerSetter<V> newBuilder() {
@@ -47,23 +45,22 @@ public final class BasicProcessor<V> extends ExecutorProcessor<V>
 
     @Override
     public int count() {
-        return this.counter.intValue();
+        return this.tracker.count();
     }
 
     @Override
     protected void doClose() {
-        while (this.count() != 0) {
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
-        }
+        this.tracker.awaitAll();
         super.doClose();
     }
 
     private boolean enqueueTask(final Runnable task) {
-        this.counter.increment();
-        if (this.isOpen() && this.doExecute(task)) {
-            return true;
+        if (this.isOpen() && this.tracker.acquire(1)) {
+            if (this.isOpen() && this.doExecute(task)) {
+                return true;
+            }
+            this.tracker.release(1);
         }
-        this.counter.decrement();
         return false;
     }
 
@@ -73,7 +70,7 @@ public final class BasicProcessor<V> extends ExecutorProcessor<V>
             try {
                 this.parent.worker.process(this.value);
             } finally {
-                this.parent.counter.decrement();
+                this.parent.tracker.release(1);
             }
         }
     }
@@ -87,7 +84,7 @@ public final class BasicProcessor<V> extends ExecutorProcessor<V>
             } catch (final Exception e) {
                 this.future.completeExceptionally(e);
             } finally {
-                this.parent.counter.decrement();
+                this.parent.tracker.release(1);
             }
         }
     }

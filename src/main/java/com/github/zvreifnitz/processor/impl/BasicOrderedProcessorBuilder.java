@@ -3,6 +3,7 @@ package com.github.zvreifnitz.processor.impl;
 import com.github.zvreifnitz.processor.OrderedProcessor;
 import com.github.zvreifnitz.processor.OrderedProcessorWorker;
 import com.github.zvreifnitz.processor.ProcessorWorker;
+import com.github.zvreifnitz.processor.impl.utils.TaskTracker;
 
 import java.util.concurrent.Executor;
 import java.util.function.BiConsumer;
@@ -35,7 +36,13 @@ public class BasicOrderedProcessorBuilder {
     }
 
     public interface ExtractorSetter<P, V> {
-        ExecutorSetter<P, V> setExtractor(final Function<V, P> extractor);
+        TaskTrackerSetter<P, V> setExtractor(final Function<V, P> extractor);
+    }
+
+    public interface TaskTrackerSetter<P, V> {
+        ExecutorSetter<P, V> setUnbounded();
+
+        ExecutorSetter<P, V> setSize(final int size);
     }
 
     public interface ExecutorSetter<P, V> {
@@ -51,11 +58,13 @@ public class BasicOrderedProcessorBuilder {
     }
 
     private static final class BuilderImpl<P, V>
-            implements WorkerSetter<P, V>, ExtractorSetter<P, V>, ExecutorSetter<P, V>,
+            implements WorkerSetter<P, V>, ExtractorSetter<P, V>,
+            TaskTrackerSetter<P, V>, ExecutorSetter<P, V>,
             CloseSetter<P, V>, Builder<P, V> {
 
         private OrderedProcessorWorker<P, V> worker;
         private Function<V, P> extractor;
+        private TaskTracker tracker;
         private Executor executor;
         private Runnable onClose;
 
@@ -84,14 +93,14 @@ public class BasicOrderedProcessorBuilder {
         }
 
         @Override
-        public ExecutorSetter<P, V> setExtractor(final Function<V, P> extractor) {
+        public TaskTrackerSetter<P, V> setExtractor(final Function<V, P> extractor) {
             this.extractor = requireNonNull(extractor);
             return this;
         }
 
         @Override
         public OrderedProcessor<P, V> build() {
-            return new BasicOrderedProcessor<>(worker, extractor, executor, onClose);
+            return new BasicOrderedProcessor<>(worker, extractor, tracker, executor, onClose);
         }
 
         @Override
@@ -115,6 +124,18 @@ public class BasicOrderedProcessorBuilder {
         @Override
         public ExtractorSetter<P, V> setWorker(final OrderedProcessorWorker<P, V> worker) {
             this.worker = requireNonNull(worker);
+            return this;
+        }
+
+        @Override
+        public ExecutorSetter<P, V> setUnbounded() {
+            this.tracker = TaskTracker.unbounded();
+            return this;
+        }
+
+        @Override
+        public ExecutorSetter<P, V> setSize(final int size) {
+            this.tracker = size > 0 ? TaskTracker.bounded(size) : TaskTracker.unbounded();
             return this;
         }
     }

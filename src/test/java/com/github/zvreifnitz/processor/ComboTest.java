@@ -24,6 +24,7 @@ public class ComboTest {
 
     private static OrderedProcessor<String, Item> buildProcessor(
             final Executor executor,
+            final int size,
             final ConcurrentLinkedQueue<Item> results,
             final boolean includeBuffers,
             final boolean compositeKey,
@@ -34,6 +35,7 @@ public class ComboTest {
                         .setExtractor(compositeKey ?
                                 item -> item.primaryId + "-" + item.secondaryId + "-" + item.tertiaryId
                                 : item -> item.tertiaryId)
+                        .setSize(includeBuffers ? 0 : size * 4)
                         .setExecutor(executor)
                         .useDefaultOnClose()
                         .build();
@@ -41,6 +43,7 @@ public class ComboTest {
                 OrderedProcessor.defaultBuilder(String.class, Item.class)
                         .setWorker(new BufferWorker(tertiaryProcessor))
                         .setExtractor(item -> "")
+                        .setUnbounded()
                         .setExecutor(executor)
                         .setOnclose(tertiaryProcessor::close)
                         .build()
@@ -51,6 +54,7 @@ public class ComboTest {
                         .setExtractor(compositeKey ?
                                 item -> item.primaryId + "-" + item.secondaryId
                                 : item -> item.secondaryId)
+                        .setSize(includeBuffers ? 0 : size * 2)
                         .setExecutor(executor)
                         .setOnclose(tertiaryProcessorBuffer::close)
                         .build();
@@ -58,6 +62,7 @@ public class ComboTest {
                 OrderedProcessor.defaultBuilder(String.class, Item.class)
                         .setWorker(new BufferWorker(secondaryProcessor))
                         .setExtractor(item -> "")
+                        .setUnbounded()
                         .setExecutor(executor)
                         .setOnclose(secondaryProcessor::close)
                         .build()
@@ -65,6 +70,7 @@ public class ComboTest {
         return OrderedProcessor.defaultBuilder(String.class, Item.class)
                 .setWorker(new PrimaryWorker(secondaryProcessorBuffer, workType))
                 .setExtractor(item -> item.primaryId)
+                .setSize(size)
                 .setExecutor(executor)
                 .setOnclose(secondaryProcessorBuffer::close)
                 .build();
@@ -91,41 +97,27 @@ public class ComboTest {
     }
 
     private static Stream<Arguments> testArgs() {
-        final List<Arguments> result = new ArrayList<>();
-        for (final var executorArg : List.of(
-                named("sameThread", (Executor) Runnable::run),
-                named("singleThread", Executors.newSingleThreadExecutor()),
-                named("threadPool", Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())),
-                named("virtualThreadPool", Executors.newVirtualThreadPerTaskExecutor()),
-                named("forkJoinPool", ForkJoinPool.commonPool())))
-            for (final var bufferedArg : List.of(
-                    named("non-buffered", false),
-                    named("buffered", true)))
-                for (final var compositeArg : List.of(
-                        named("singleKey", false),
-                        named("compositeKey", true)))
-                    for (final var workTypeArg : Arrays.stream(FakeWorkType.values())
-                            .map(wt -> named(wt.name().toLowerCase(), wt))
-                            .toList())
-                        result.add(arguments(executorArg, bufferedArg, compositeArg, workTypeArg));
-        return result.stream();
+        return TestArgs.TEST_ARGS_LIST.stream();
     }
 
     @ParameterizedTest
     @MethodSource("testArgs")
     void orderedTest(
             final Executor executor,
+            final int size,
             final boolean includeBuffers,
             final boolean compositeKey,
             final FakeWorkType workType) {
         final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey, workType)) {
+        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, size, results, includeBuffers, compositeKey, workType)) {
             for (int value = 0; value < TOTAL; value++) {
-                processor.enqueue(new Item(
+                while (!processor.enqueue(new Item(
                         "" + (value % PRIMARY),
                         "" + (value % SECONDARY),
                         "" + (value % TERTIARY),
-                        value));
+                        value))) {
+                    Thread.yield();
+                }
             }
         }
 
@@ -149,17 +141,20 @@ public class ComboTest {
     @MethodSource("testArgs")
     void randomTest(
             final Executor executor,
+            final int size,
             final boolean includeBuffers,
             final boolean compositeKey,
             final FakeWorkType workType) {
         final ConcurrentLinkedQueue<Item> results = new ConcurrentLinkedQueue<>();
-        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, results, includeBuffers, compositeKey, workType)) {
+        try (final OrderedProcessor<String, Item> processor = buildProcessor(executor, size, results, includeBuffers, compositeKey, workType)) {
             for (int value = 0; value < TOTAL; value++) {
-                processor.enqueue(new Item(
+                while (!processor.enqueue(new Item(
                         "" + ThreadLocalRandom.current().nextInt(PRIMARY),
                         "" + ThreadLocalRandom.current().nextInt(SECONDARY),
                         "" + ThreadLocalRandom.current().nextInt(TERTIARY),
-                        value));
+                        value))) {
+                    Thread.yield();
+                }
             }
         }
 
@@ -189,7 +184,9 @@ public class ComboTest {
         @Override
         public void process(final String partition, final Item value, final Iterable<Item> remaining) {
             fakeWork(workType);
-            secondaryProcessor.enqueue(value);
+            while (!secondaryProcessor.enqueue(value)) {
+                Thread.yield();
+            }
         }
     }
 
@@ -198,7 +195,9 @@ public class ComboTest {
         @Override
         public void process(final String partition, final Item value, final Iterable<Item> remaining) {
             fakeWork(workType);
-            tertiaryProcessor.enqueue(value);
+            while (!tertiaryProcessor.enqueue(value)) {
+                Thread.yield();
+            }
         }
     }
 
@@ -215,15 +214,48 @@ public class ComboTest {
             implements OrderedProcessorWorker<String, Item> {
         @Override
         public void process(final String partition, final Item value, final Iterable<Item> remaining) {
-            processor.enqueue(value);
+            while (!processor.enqueue(value)) {
+                Thread.yield();
+            }
             final Iterator<Item> iterator = remaining.iterator();
             while (iterator.hasNext()) {
-                processor.enqueue(iterator.next());
-                iterator.remove();
+                if (processor.enqueue(iterator.next())) {
+                    iterator.remove();
+                } else {
+                    break;
+                }
             }
         }
     }
 
     record Item(String primaryId, String secondaryId, String tertiaryId, int value) {
+    }
+
+    private static class TestArgs {
+        private final static List<Arguments> TEST_ARGS_LIST;
+
+        static {
+            final List<Arguments> result = new ArrayList<>();
+            for (final var executorArg : List.of(
+                    named("sameThread", (Executor) Runnable::run),
+                    named("singleThread", Executors.newSingleThreadExecutor()),
+                    named("threadPool", Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())),
+                    named("virtualThreadPool", Executors.newVirtualThreadPerTaskExecutor()),
+                    named("forkJoinPool", ForkJoinPool.commonPool())))
+                for (final var sizeArg : List.of(
+                        named("unbounded", 0),
+                        named("bounded", 1)))
+                    for (final var bufferedArg : List.of(
+                            named("non-buffered", false),
+                            named("buffered", true)))
+                        for (final var compositeArg : List.of(
+                                named("singleKey", false),
+                                named("compositeKey", true)))
+                            for (final var workTypeArg : Arrays.stream(FakeWorkType.values())
+                                    .map(wt -> named(wt.name().toLowerCase(), wt))
+                                    .toList())
+                                result.add(arguments(executorArg, sizeArg, bufferedArg, compositeArg, workTypeArg));
+            TEST_ARGS_LIST = result;
+        }
     }
 }

@@ -5,13 +5,12 @@ import com.github.zvreifnitz.processor.OrderedProcessorWorker;
 import com.github.zvreifnitz.processor.Processor;
 import com.github.zvreifnitz.processor.impl.base.ExecutorProcessor;
 import com.github.zvreifnitz.processor.impl.utils.ProcessorFuture;
+import com.github.zvreifnitz.processor.impl.utils.TaskTracker;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -23,18 +22,19 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
     private final OrderedProcessorWorker<P, V> worker;
     private final Function<V, P> extractor;
     private final PartitionQueue<P, V> partitions;
-    private final LongAdder counter;
+    private final TaskTracker tracker;
 
     public BasicOrderedProcessor(
             final OrderedProcessorWorker<P, V> worker,
             final Function<V, P> extractor,
+            final TaskTracker tracker,
             final Executor executor,
             final Runnable afterClose) {
         super(executor, afterClose);
         this.worker = requireNonNull(worker);
         this.extractor = requireNonNull(extractor);
+        this.tracker = requireNonNull(tracker);
         this.partitions = this.getInfo().virtualThread() ? new SyncPartitionQueue<>() : new ChmPartitionQueue<>();
-        this.counter = new LongAdder();
     }
 
     public static <P, V> BasicOrderedProcessorBuilder.WorkerSetter<P, V> newBuilder() {
@@ -67,14 +67,12 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
 
     @Override
     public int count() {
-        return this.counter.intValue();
+        return this.tracker.count();
     }
 
     @Override
     protected void doClose() {
-        while (this.count() != 0) {
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
-        }
+        this.tracker.awaitAll();
         super.doClose();
     }
 
@@ -86,18 +84,19 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
     }
 
     private boolean enqueue(final P partitionKey, final Node<V> node) {
-        this.counter.increment();
-        while (this.isOpen()) {
-            final Partition<V> partition = this.partitions.getPartition(partitionKey, node);
-            if (partition == null) {
-                this.enqueueTask(new Task<>(this, partitionKey, node));
-                return true;
+        if (this.isOpen() && this.tracker.acquire(1)) {
+            while (this.isOpen()) {
+                final Partition<V> partition = this.partitions.getPartition(partitionKey, node);
+                if (partition == null) {
+                    this.enqueueTask(new Task<>(this, partitionKey, node));
+                    return true;
+                }
+                if (partition.append(node)) {
+                    return true;
+                }
             }
-            if (partition.append(node)) {
-                return true;
-            }
+            this.tracker.release(1);
         }
-        this.counter.decrement();
         return false;
     }
 
@@ -200,7 +199,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
                 }
                 this.doneNodes = null;
             }
-            this.parent.counter.add(-count);
+            this.parent.tracker.release(count);
         }
 
         public void completeExceptionally(final Exception exception) {
@@ -218,7 +217,7 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
                 }
                 this.doneNodes = null;
             }
-            this.parent.counter.add(-count);
+            this.parent.tracker.release(count);
         }
 
         public void addToDoneNode(final Node<V> node) {
@@ -352,8 +351,8 @@ public final class BasicOrderedProcessor<P, V> extends ExecutorProcessor<V>
             if (this.cached == null) {
                 this.cached = this.getNextNode();
             }
-            if (this.cached != null) {
-                this.removeAllowed = true;
+            this.removeAllowed = this.cached != null;
+            if (this.removeAllowed) {
                 this.node = this.cached;
                 this.cached = this.getNextNode();
                 return this.node.value;
